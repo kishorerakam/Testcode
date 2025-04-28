@@ -1,0 +1,81 @@
+import sqlparse
+import re
+
+
+def read_sql_file(file_path):
+    """
+    Read raw SQL from a file.
+    """
+    with open(file_path, 'r', encoding='utf-8') as file:
+        sql_text = file.read()
+    return sql_text
+
+
+def preprocess_snowflake_sql_for_sqlparse(sql_text: str) -> str:
+    """
+    Preprocess Snowflake SQL before passing to sqlparse for parsing.
+    """
+
+    # 1. Remove comments
+    sql_text = re.sub(r'--.*?$', '', sql_text, flags=re.MULTILINE)
+    sql_text = re.sub(r'/\*.*?\*/', '', sql_text, flags=re.DOTALL)
+
+    # 2. Comment out QUALIFY
+    sql_text = re.sub(r'\bQUALIFY\b', '-- QUALIFY', sql_text, flags=re.IGNORECASE)
+
+    # 3. Remove COPY INTO, PUT, GET, LIST
+    sql_text = re.sub(r'\b(COPY\s+INTO|PUT|GET|LIST|UNLOAD)\b.*?;', '', sql_text, flags=re.IGNORECASE | re.DOTALL)
+
+    # 4. Normalize JSON field access
+    sql_text = re.sub(r'(\w+)(:\w+)+::(\w+)', lambda m: m.group(0).replace(':', '_').replace('::', '_'), sql_text)
+
+    # 5. Replace @stage references
+    sql_text = re.sub(r'@\S+', 'STAGE_REFERENCE', sql_text)
+
+    # 6. Remove SAMPLE clauses
+    sql_text = re.sub(r'\bSAMPLE\s*\(.*?\)', '', sql_text, flags=re.IGNORECASE)
+
+    # 7. Normalize WITH RECURSIVE
+    sql_text = re.sub(r'\bWITH\s+RECURSIVE\b', 'WITH', sql_text, flags=re.IGNORECASE)
+
+    # 8. Remove FILE_FORMAT clauses
+    sql_text = re.sub(r'FILE_FORMAT\s*=\s*\(.*?\)', '', sql_text, flags=re.IGNORECASE | re.DOTALL)
+
+    # 9. Remove blank lines and strip
+    sql_text = '\n'.join(line.strip() for line in sql_text.splitlines() if line.strip())
+
+    return sql_text
+
+
+def parse_sql(sql_text):
+    """
+    Parse SQL using sqlparse after cleaning.
+    """
+    parsed_statements = sqlparse.parse(sql_text)
+    return parsed_statements
+
+
+def main(sql_file_path):
+    """
+    Full runner: Read -> Clean -> Parse -> Display tokens
+    """
+    print(f"🔵 Reading SQL file: {sql_file_path}")
+    raw_sql = read_sql_file(sql_file_path)
+
+    print("🧹 Preprocessing Snowflake SQL...")
+    cleaned_sql = preprocess_snowflake_sql_for_sqlparse(raw_sql)
+
+    print("🛠 Parsing cleaned SQL with sqlparse...")
+    parsed = parse_sql(cleaned_sql)
+
+    print("\n=== Parsed SQL Tokens ===")
+    for idx, stmt in enumerate(parsed, start=1):
+        print(f"\n🔹 Statement {idx}:")
+        for token in stmt.tokens:
+            print(f"  - {token.ttype}: {token.value.strip()}")
+
+
+if __name__ == "__main__":
+    # 👉 Change this path to your SQL file
+    sql_file_path = 'your_snowflake_query.sql'
+    main(sql_file_path)
