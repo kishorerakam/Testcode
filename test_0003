@@ -1,0 +1,164 @@
+import os
+import re
+import sqlparse
+import json
+from collections import defaultdict, deque
+from sqlparse.sql import Identifier, IdentifierList
+from sqlparse.tokens import Keyword, DML
+
+def preprocess_snowflake_sql_for_sqlparse(sql_text: str) -> str:
+    sql_text = re.sub(r'\$\{(\w+)\}', r'DUMMY_\1', sql_text)
+    sql_text = re.sub(r'--.*?$', '', sql_text, flags=re.MULTILINE)
+    sql_text = re.sub(r'/\*.*?\*/', '', sql_text, flags=re.DOTALL)
+    sql_text = re.sub(r'\bQUALIFY\b', '-- QUALIFY', sql_text, flags=re.IGNORECASE)
+    sql_text = re.sub(r'\b(COPY\s+INTO|PUT|GET|LIST|UNLOAD)\b.*?;', '', sql_text, flags=re.IGNORECASE | re.DOTALL)
+    sql_text = re.sub(r'(\w+)(:\w+)+::(\w+)', lambda m: m.group(0).replace(':', '_').replace('::', '_'), sql_text)
+    sql_text = re.sub(r'@\S+', 'STAGE_REFERENCE', sql_text)
+    sql_text = re.sub(r'\bSAMPLE\s*\(.*?\)', '', sql_text, flags=re.IGNORECASE)
+    sql_text = re.sub(r'\bWITH\s+RECURSIVE\b', 'WITH', sql_text, flags=re.IGNORECASE)
+    sql_text = re.sub(r'FILE_FORMAT\s*=\s*\(.*?\)', '', sql_text, flags=re.IGNORECASE | re.DOTALL)
+    sql_text = '\n'.join(line.strip() for line in sql_text.splitlines() if line.strip())
+    return sql_text
+
+def extract_lineage_from_tokens(parsed_statements):
+    sources = set()
+    targets = set()
+    ctes = set()
+
+    for statement in parsed_statements:
+        tokens = [token for token in statement.tokens if not token.is_whitespace]
+        prev_token_value = None
+
+        for token in tokens:
+            if token.is_group:
+                sub_sources, sub_targets, sub_ctes = extract_lineage_from_tokens([token])
+                sources.update(sub_sources)
+                targets.update(sub_targets)
+                ctes.update(sub_ctes)
+
+            if token.ttype is Keyword:
+                token_value_upper = token.value.upper()
+
+                if token_value_upper == "WITH":
+                    next_token = _get_next_identifier(tokens, token)
+                    if next_token:
+                        ctes.add(next_token.get_real_name().upper())
+
+                elif token_value_upper in {"FROM", "JOIN", "USING"}:
+                    next_token = _get_next_identifier(tokens, token)
+                    if next_token:
+                        sources.add(next_token.get_real_name().upper())
+
+                elif token_value_upper == "INTO" and prev_token_value == "INSERT":
+                    next_token = _get_next_identifier(tokens, token)
+                    if next_token:
+                        targets.add(next_token.get_real_name().upper())
+
+                elif token_value_upper in {"UPDATE", "MERGE"}:
+                    next_token = _get_next_identifier(tokens, token)
+                    if next_token:
+                        targets.add(next_token.get_real_name().upper())
+
+            if token.ttype is DML:
+                prev_token_value = token.value.upper()
+
+    return sources, targets, ctes
+
+def _get_next_identifier(tokens, current_token):
+    found = False
+    for token in tokens:
+        if found:
+            if isinstance(token, Identifier):
+                return token
+            elif isinstance(token, IdentifierList):
+                for identifier in token.get_identifiers():
+                    return identifier
+        if token == current_token:
+            found = True
+    return None
+
+def process_sql_files_from_folders(folder_paths):
+    lineage_graph = defaultdict(list)
+
+    for folder_path in folder_paths:
+        print(f"📂 Processing folder: {folder_path}")
+        if not os.path.exists(folder_path):
+            print(f"⚠️ Folder does not exist: {folder_path}")
+            continue
+
+        for file in os.listdir(folder_path):
+            if file.endswith('.sql'):
+                full_path = os.path.join(folder_path, file)
+                print(f"🔵 Reading file: {full_path}")
+                with open(full_path, 'r', encoding='utf-8') as f:
+                    sql_text = f.read()
+
+                cleaned_sql = preprocess_snowflake_sql_for_sqlparse(sql_text)
+                parsed_statements = sqlparse.parse(cleaned_sql)
+                sources, targets, ctes = extract_lineage_from_tokens(parsed_statements)
+
+                for target in targets:
+                    for source in sources.union(ctes):
+                        if source and target and source != target:
+                            lineage_graph[source].append(target)
+
+    return lineage_graph
+
+def save_lineage_graph_to_json(lineage_graph, output_file='lineage_output.json'):
+    """
+    Save the full lineage graph to a JSON file.
+    """
+    # Convert defaultdict to normal dict for saving
+    normal_graph = {k: v for k, v in lineage_graph.items()}
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(normal_graph, f, indent=4)
+    print(f"✅ Lineage graph saved to {output_file}")
+
+def load_lineage_graph_from_json(json_file):
+    """
+    Load lineage graph from a JSON file.
+    """
+    with open(json_file, 'r', encoding='utf-8') as f:
+        graph = json.load(f)
+    return graph
+
+def display_lineage_paths(graph):
+    """
+    Traverse and display lineage from birth tables.
+    """
+    all_sources = set(graph.keys())
+    all_targets = set()
+    for targets in graph.values():
+        all_targets.update(targets)
+
+    birth_tables = all_sources - all_targets
+    print("\n🌟 Birth Tables Detected:", birth_tables)
+
+    print("\n🔗 Full Lineage Paths (Birth → Intermediate → End):\n")
+    for birth_table in birth_tables:
+        queue = deque()
+        queue.append((birth_table, [birth_table]))
+
+        while queue:
+            current, path = queue.popleft()
+            if current not in graph:
+                print(" → ".join(path))
+            else:
+                for next_table in graph[current]:
+                    if next_table not in path:
+                        queue.append((next_table, path + [next_table]))
+
+if __name__ == "__main__":
+    # 👉 Change your real folders here
+    folder_paths = [
+        '/path/to/first/folder',
+        '/path/to/second/folder'
+    ]
+
+    # Step 1: Build the lineage graph and save to JSON
+    lineage_graph = process_sql_files_from_folders(folder_paths)
+    save_lineage_graph_to_json(lineage_graph, output_file='lineage_output.json')
+
+    # Step 2: Later load from JSON and display without memory crash
+    # lineage_graph = load_lineage_graph_from_json('lineage_output.json')
+    # display_lineage_paths(lineage_graph)
