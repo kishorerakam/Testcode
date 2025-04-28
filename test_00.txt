@@ -1,0 +1,46 @@
+import re
+
+def preprocess_snowflake_sql_for_sqlparse(sql_text: str) -> str:
+    """
+    Preprocess Snowflake SQL before passing to sqlparse for parsing.
+    """
+
+    # 1. Remove single-line and multi-line comments
+    sql_text = re.sub(r'--.*?$', '', sql_text, flags=re.MULTILINE)
+    sql_text = re.sub(r'/\*.*?\*/', '', sql_text, flags=re.DOTALL)
+
+    # 2. Comment out QUALIFY
+    sql_text = re.sub(r'\bQUALIFY\b', '-- QUALIFY', sql_text, flags=re.IGNORECASE)
+
+    # 3. Remove COPY INTO, PUT, GET, LIST, UNLOAD
+    sql_text = re.sub(r'\b(COPY\s+INTO|PUT|GET|LIST|UNLOAD)\b.*?;', '', sql_text, flags=re.IGNORECASE | re.DOTALL)
+
+    # 4. Normalize JSON column access (col:subcol::type -> col_subcol_type)
+    sql_text = re.sub(r'(\w+)(:\w+)+::(\w+)', lambda m: m.group(0).replace(':', '_').replace('::', '_'), sql_text)
+
+    # 5. Replace @stage references (e.g., @my_stage/data/file)
+    sql_text = re.sub(r'@\S+', 'STAGE_REFERENCE', sql_text)
+
+    # 6. Remove SAMPLE clauses
+    sql_text = re.sub(r'\bSAMPLE\s*\(.*?\)', '', sql_text, flags=re.IGNORECASE)
+
+    # 7. Normalize WITH RECURSIVE
+    sql_text = re.sub(r'\bWITH\s+RECURSIVE\b', 'WITH', sql_text, flags=re.IGNORECASE)
+
+    # 8. Remove FILE_FORMAT settings inside COPY INTO
+    sql_text = re.sub(r'FILE_FORMAT\s*=\s*\(.*?\)', '', sql_text, flags=re.IGNORECASE | re.DOTALL)
+
+    # 9. Remove MATCH_RECOGNIZE patterns (complex pattern matching, not supported by sqlparse)
+    sql_text = re.sub(r'\bMATCH_RECOGNIZE\b.*?(\))', '-- MATCH_RECOGNIZE_REMOVED', sql_text, flags=re.IGNORECASE | re.DOTALL)
+
+    # 10. Optionally flatten FLATTEN() functions
+    sql_text = re.sub(r'\bFLATTEN\s*\(.*?\)', 'FLATTEN_DUMMY', sql_text, flags=re.IGNORECASE)
+
+    # 11. Optionally replace ARRAY_AGG, OBJECT_CONSTRUCT functions (for very strict parsing)
+    sql_text = re.sub(r'\bARRAY_AGG\s*\(', 'ARRAY_AGG_DUMMY(', sql_text, flags=re.IGNORECASE)
+    sql_text = re.sub(r'\bOBJECT_CONSTRUCT\s*\(', 'OBJECT_CONSTRUCT_DUMMY(', sql_text, flags=re.IGNORECASE)
+
+    # 12. Remove extra blank lines
+    sql_text = '\n'.join(line.strip() for line in sql_text.splitlines() if line.strip())
+
+    return sql_text
