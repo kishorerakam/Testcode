@@ -1,0 +1,153 @@
+import os
+import re
+import sqlparse
+from collections import defaultdict, deque
+from sqlparse.sql import Identifier, IdentifierList
+from sqlparse.tokens import Keyword, DML
+
+def preprocess_snowflake_sql_for_sqlparse(sql_text: str) -> str:
+    """
+    Preprocess Snowflake SQL before parsing.
+    """
+    sql_text = re.sub(r'\$\{(\w+)\}', r'DUMMY_\1', sql_text)  # Replace metadata variables
+    sql_text = re.sub(r'--.*?$', '', sql_text, flags=re.MULTILINE)  # Remove single-line comments
+    sql_text = re.sub(r'/\*.*?\*/', '', sql_text, flags=re.DOTALL)  # Remove multi-line comments
+    sql_text = re.sub(r'\bQUALIFY\b', '-- QUALIFY', sql_text, flags=re.IGNORECASE)  # Comment out QUALIFY
+    sql_text = re.sub(r'\b(COPY\s+INTO|PUT|GET|LIST|UNLOAD)\b.*?;', '', sql_text, flags=re.IGNORECASE | re.DOTALL)  # Remove COPY INTO, PUT, GET
+    sql_text = re.sub(r'(\w+)(:\w+)+::(\w+)', lambda m: m.group(0).replace(':', '_').replace('::', '_'), sql_text)  # Normalize JSON access
+    sql_text = re.sub(r'@\S+', 'STAGE_REFERENCE', sql_text)  # Normalize @stages
+    sql_text = re.sub(r'\bSAMPLE\s*\(.*?\)', '', sql_text, flags=re.IGNORECASE)  # Remove SAMPLE
+    sql_text = re.sub(r'\bWITH\s+RECURSIVE\b', 'WITH', sql_text, flags=re.IGNORECASE)  # Normalize WITH RECURSIVE
+    sql_text = re.sub(r'FILE_FORMAT\s*=\s*\(.*?\)', '', sql_text, flags=re.IGNORECASE | re.DOTALL)  # Remove FILE_FORMAT
+    sql_text = '\n'.join(line.strip() for line in sql_text.splitlines() if line.strip())  # Clean blank lines
+    return sql_text
+
+def extract_lineage_from_tokens(parsed_statements):
+    """
+    Extract sources, targets, and CTEs from parsed SQL tokens.
+    """
+    sources = set()
+    targets = set()
+    ctes = set()
+
+    for statement in parsed_statements:
+        tokens = [token for token in statement.tokens if not token.is_whitespace]
+        prev_token_value = None
+
+        for token in tokens:
+            if token.is_group:
+                sub_sources, sub_targets, sub_ctes = extract_lineage_from_tokens([token])
+                sources.update(sub_sources)
+                targets.update(sub_targets)
+                ctes.update(sub_ctes)
+
+            if token.ttype is Keyword:
+                token_value_upper = token.value.upper()
+
+                if token_value_upper == "WITH":
+                    next_token = _get_next_identifier(tokens, token)
+                    if next_token:
+                        ctes.add(next_token.get_real_name().upper())
+
+                elif token_value_upper in {"FROM", "JOIN", "USING"}:
+                    next_token = _get_next_identifier(tokens, token)
+                    if next_token:
+                        sources.add(next_token.get_real_name().upper())
+
+                elif token_value_upper == "INTO" and prev_token_value == "INSERT":
+                    next_token = _get_next_identifier(tokens, token)
+                    if next_token:
+                        targets.add(next_token.get_real_name().upper())
+
+                elif token_value_upper in {"UPDATE", "MERGE"}:
+                    next_token = _get_next_identifier(tokens, token)
+                    if next_token:
+                        targets.add(next_token.get_real_name().upper())
+
+            if token.ttype is DML:
+                prev_token_value = token.value.upper()
+
+    return sources, targets, ctes
+
+def _get_next_identifier(tokens, current_token):
+    """
+    Helper to find next Identifier token after current token.
+    """
+    found = False
+    for token in tokens:
+        if found:
+            if isinstance(token, Identifier):
+                return token
+            elif isinstance(token, IdentifierList):
+                for identifier in token.get_identifiers():
+                    return identifier
+        if token == current_token:
+            found = True
+    return None
+
+def process_sql_files_from_folders(folder_paths):
+    """
+    Read .sql files from multiple folders, build global lineage graph.
+    """
+    lineage_graph = defaultdict(list)
+
+    for folder_path in folder_paths:
+        print(f"📂 Processing folder: {folder_path}")
+        if not os.path.exists(folder_path):
+            print(f"⚠️ Folder does not exist: {folder_path}")
+            continue
+
+        for file in os.listdir(folder_path):
+            if file.endswith('.sql'):
+                full_path = os.path.join(folder_path, file)
+                print(f"🔵 Reading file: {full_path}")
+                with open(full_path, 'r', encoding='utf-8') as f:
+                    sql_text = f.read()
+
+                cleaned_sql = preprocess_snowflake_sql_for_sqlparse(sql_text)
+                parsed_statements = sqlparse.parse(cleaned_sql)
+                sources, targets, ctes = extract_lineage_from_tokens(parsed_statements)
+
+                for target in targets:
+                    for source in sources.union(ctes):
+                        if source and target and source != target:
+                            lineage_graph[source].append(target)
+
+    return lineage_graph
+
+def traverse_lineage(lineage_graph):
+    """
+    Traverse lineage graph from source (birth tables) to final target tables.
+    """
+    # Find all unique tables
+    all_sources = set(lineage_graph.keys())
+    all_targets = set()
+    for targets in lineage_graph.values():
+        all_targets.update(targets)
+
+    birth_tables = all_sources - all_targets
+    print("\n🌟 Birth Tables Detected:", birth_tables)
+
+    print("\n🔗 Full Lineage Paths (Birth → Intermediate → End):\n")
+    for birth_table in birth_tables:
+        queue = deque()
+        queue.append((birth_table, [birth_table]))
+
+        while queue:
+            current, path = queue.popleft()
+            if current not in lineage_graph:
+                print(" → ".join(path))
+            else:
+                for next_table in lineage_graph[current]:
+                    if next_table not in path:  # avoid cycles
+                        queue.append((next_table, path + [next_table]))
+
+if __name__ == "__main__":
+    # 👉 Set your real folder paths containing .sql files
+    folder_paths = [
+        '/path/to/first/folder',   # Change to real
+        '/path/to/second/folder'   # Change to real
+    ]
+
+    lineage_graph = process_sql_files_from_folders(folder_paths)
+    traverse_lineage(lineage_graph)
