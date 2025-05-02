@@ -25,7 +25,13 @@
 </head>
 <body>
   <h2>Table Lineage Viewer</h2>
-  <input type="text" id="tableSearch" placeholder="Enter table name..." />
+  <input type="text" id="tableSearch" placeholder="Enter table name..." style="width: 400px; font-size: 16px; padding: 6px 12px;" />
+  <button id="viewBtn" style="margin-left: 10px;">View Lineage</button>
+  <div style="margin: 10px 0;">
+    <button id="btn-up">Upstream</button>
+    <button id="btn-down">Downstream</button>
+    <button id="btn-both">Both</button>
+  </div>
   <div id="placeholder" style="margin-top: 10px; color: gray;">Please enter the table name to view its lineage.</div>
   <svg></svg>
 <script>
@@ -51,8 +57,10 @@
     .attr("d", "M0,-5L10,0L0,5")
     .attr("fill", "#333");
 
-  document.getElementById("tableSearch").addEventListener("input", function () {
-    const term = this.value.trim().toLowerCase();
+  let currentDirection = "up";
+
+  document.getElementById("viewBtn").addEventListener("click", function () {
+    const term = document.getElementById("tableSearch").value.trim().toLowerCase();
 
     if (!term) {
       svg.style("display", "none");
@@ -76,30 +84,57 @@
         const relatedNodes = new Set();
         const relatedEdges = [];
 
-        function findConnected(table, direction = "both") {
+        function findConnected(table, direction = "up") {
           if (!table) return;
+          table = table.toLowerCase();
+          if (relatedNodes.has(table)) return;
           relatedNodes.add(table);
 
-          if (direction !== "up") {
+          if (direction === "up") {
             data.links.forEach(link => {
-              if (link.source.toLowerCase() === table && !relatedNodes.has(link.target.toLowerCase())) {
+              if (link.target.toLowerCase() === table) {
                 relatedEdges.push(link);
-                findConnected(link.target.toLowerCase(), direction);
+                findConnected(link.source, direction);
               }
             });
-          }
-
-          if (direction !== "down") {
+          } else if (direction === "down") {
             data.links.forEach(link => {
-              if (link.target.toLowerCase() === table && !relatedNodes.has(link.source.toLowerCase())) {
+              if (link.source.toLowerCase() === table) {
                 relatedEdges.push(link);
-                findConnected(link.source.toLowerCase(), direction);
+                findConnected(link.target, direction);
               }
             });
+          } else if (direction === "both") {
+            const visited = new Set();
+            function traverseUp(table) {
+              if (!table || visited.has("up:" + table)) return;
+              visited.add("up:" + table);
+              data.links.forEach(link => {
+                if (link.target.toLowerCase() === table) {
+                  relatedEdges.push(link);
+                  relatedNodes.add(link.source.toLowerCase());
+                  traverseUp(link.source.toLowerCase());
+                }
+              });
+            }
+            function traverseDown(table) {
+              if (!table || visited.has("down:" + table)) return;
+              visited.add("down:" + table);
+              data.links.forEach(link => {
+                if (link.source.toLowerCase() === table) {
+                  relatedEdges.push(link);
+                  relatedNodes.add(link.target.toLowerCase());
+                  traverseDown(link.target.toLowerCase());
+                }
+              });
+            }
+            relatedNodes.add(table);
+            traverseUp(table);
+            traverseDown(table);
           }
         }
 
-        findConnected(term);
+        findConnected(term, currentDirection);
 
         const isIsolated = !data.links.some(link =>
           link.source.toLowerCase() === term || link.target.toLowerCase() === term
@@ -115,51 +150,65 @@
 
         svgGroup.selectAll("*").remove();
 
-        data.nodes.forEach(node => {
-          if (relatedNodes.has(node.id.toLowerCase())) {
-            const isFocused = node.id.toLowerCase() === term;
-            const bgColor = isFocused ? "#ffeb3b" : (
-              node.type === 'source' ? "#b2dfdb"
-              : node.type === 'target' ? "#c8e6c9"
-              : "#f8bbd0"
-            );
-            const borderColor = isFocused ? "#f57c00" : "#333";
-            const fontWeight = isFocused ? "bold" : "normal";
-
-            g.setNode(node.id, {
-              labelType: "text",
-              label: `${node.id}${node.operation ? '\n(' + node.operation + ')' : ''}`,
-              style: `fill: ${bgColor}; stroke: ${borderColor}; stroke-width: 2px; font-weight: ${fontWeight};`,
-              padding: 10,
-              rx: 6,
-              ry: 6
-            });
-          }
-        });
-
-        relatedEdges.forEach(link => {
-          const isDashed = /left|right|full|outer/i.test(link.join_type || "");
-          const isFocusedEdge = (
-            link.source.toLowerCase() === term ||
-            link.target.toLowerCase() === term
+        const nodeMap = Object.fromEntries(data.nodes.map(n => [n.id.toLowerCase(), n]));
+        relatedNodes.forEach(id => {
+          const node = nodeMap[id];
+          if (!node) return;
+          const isFocused = id === term;
+          const bgColor = isFocused ? "#ffeb3b" : (
+            node.type === 'source' ? "#b2dfdb"
+            : node.type === 'target' ? "#c8e6c9"
+            : "#f8bbd0"
           );
-          g.setEdge(link.source, link.target, {
-            arrowhead: "vee",
-            lineInterpolate: "basis",
-            label: link.join_type || "",
-            style: `
-              stroke: ${isFocusedEdge ? "#f57c00" : "#333"};
-              stroke-width: ${isFocusedEdge ? "2.5px" : "1.5px"};
-              stroke-dasharray: ${isDashed ? "4,2" : "none"};
-              marker-end: url(#arrowhead);
-              fill: none;
-            `,
-            labelStyle: "font-size: 11px; fill: #000; font-weight: bold;"
+          const borderColor = isFocused ? "#f57c00" : "#333";
+          const fontWeight = isFocused ? "bold" : "normal";
+
+          g.setNode(node.id, {
+            label: `<div style='display:flex;align-items:center;justify-content:space-between;gap:8px;'>
+                      <span>${node.id}${node.operation ? '<br>(' + node.operation + ')' : ''}</span>
+                      <span class='copy-icon' data-table="${node.id}" style='cursor:pointer;'>📋</span>
+                   </div>`,
+            labelType: "html",
+            style: `fill: ${bgColor}; stroke: ${borderColor}; stroke-width: 2px; font-weight: ${fontWeight};`,
+            padding: 10,
+            rx: 6,
+            ry: 6
           });
         });
 
+        relatedEdges
+          .filter(link => relatedNodes.has(link.source.toLowerCase()) && relatedNodes.has(link.target.toLowerCase()))
+          .forEach(link => {
+            const isDashed = /left|right|full|outer/i.test(link.join_type || "");
+            const isFocusedEdge = (
+              link.source.toLowerCase() === term || link.target.toLowerCase() === term
+            );
+            g.setEdge(link.source, link.target, {
+              arrowhead: "vee",
+              lineInterpolate: "basis",
+              label: link.join_type || "",
+              style: `
+                stroke: ${isFocusedEdge ? "#f57c00" : "#333"};
+                stroke-width: ${isFocusedEdge ? "2.5px" : "1.5px"};
+                stroke-dasharray: ${isDashed ? "4,2" : "none"};
+                marker-end: url(#arrowhead);
+                fill: none;
+              `,
+              labelStyle: "font-size: 11px; fill: #000; font-weight: bold;"
+            });
+          });
+
         const render = new dagreD3.render();
         render(svgGroup, g);
+
+        // Enable silent copy for table name when 📋 is clicked
+        svg.selectAll(".copy-icon").on("click", function(event) {
+          const table = this.getAttribute("data-table");
+          if (table) {
+            navigator.clipboard.writeText(table).catch(() => {});
+          }
+          event.stopPropagation();
+        });
 
         const xCenterOffset = Math.max(0, (svg.node().getBoundingClientRect().width - g.graph().width) / 2);
         svgGroup.attr("transform", "translate(" + xCenterOffset + ", 40)");
@@ -172,8 +221,21 @@
   // Optional: add Enter key support
   document.getElementById("tableSearch").addEventListener("keypress", function(e) {
     if (e.key === 'Enter') {
-      this.dispatchEvent(new Event('input'));
+      document.getElementById("viewBtn").click();
     }
+  });
+
+  document.getElementById("btn-up").addEventListener("click", () => {
+    currentDirection = "up";
+    document.getElementById("viewBtn").click();
+  });
+  document.getElementById("btn-down").addEventListener("click", () => {
+    currentDirection = "down";
+    document.getElementById("viewBtn").click();
+  });
+  document.getElementById("btn-both").addEventListener("click", () => {
+    currentDirection = "both";
+    document.getElementById("viewBtn").click();
   });
 </script>
 </body>
