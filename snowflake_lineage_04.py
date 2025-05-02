@@ -239,12 +239,15 @@ def process_sql_files(folder_paths):
 
                     for target in targets:
                         target_str = target if isinstance(target, str) else str(target)
-                        node_metadata[target_str] = {
-                            "type": "target",
-                            "operation": operation,
-                            "is_temp": "TEMP" in target_str.upper() or "TEMPORARY" in target_str.upper(),
-                            "file": current_sql_filename
-                        }
+                        if target_str not in node_metadata:
+                            node_metadata[target_str] = {
+                                "type": "target",
+                                "operation": [],
+                                "is_temp": "TEMP" in target_str.upper() or "TEMPORARY" in target_str.upper(),
+                                "file": current_sql_filename
+                            }
+                        if operation and operation not in node_metadata[target_str]["operation"]:
+                            node_metadata[target_str]["operation"].append(operation)
                     for source in sources:
                         if isinstance(source, tuple):
                             source_name, _ = source
@@ -255,7 +258,7 @@ def process_sql_files(folder_paths):
                         if source_name_str not in node_metadata:
                             node_metadata[source_name_str] = {
                                 "type": "source",
-                                "operation": "",
+                                "operation": [],
                                 "is_temp": "TEMP" in source_name_str.upper() or "TEMPORARY" in source_name_str.upper(),
                                 "file": current_sql_filename
                             }
@@ -303,10 +306,14 @@ def save_lineage_to_json(graph, metadata, output_file='lineage_output.json'):
 
         nodes = []
         for node_id, meta in sorted(node_dict.items()):
+            op_map = {"INSERT": "I", "UPDATE": "U", "MERGE": "M", "CREATE": "C", "DELETE": "D", "CREATE TABLE AS": "C"}
+            # If meta.get("operation", []) is empty, set operation to "" instead of an empty list
             nodes.append({
                 "id": node_id,
                 "type": meta.get("type", "transform"),
-                "operation": meta.get("operation", ""),
+                "operation": (
+                    [op_map.get(op, op) for op in meta["operation"]] if meta.get("operation") else ""
+                ),
                 "is_temp": meta.get("is_temp", False),
                 "file": meta.get("file", None)
             })
