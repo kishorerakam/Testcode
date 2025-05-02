@@ -101,7 +101,11 @@
 
         findConnected(term);
 
-        if (relatedNodes.size === 0) {
+        const isIsolated = !data.links.some(link =>
+          link.source.toLowerCase() === term || link.target.toLowerCase() === term
+        );
+
+        if (relatedNodes.size === 0 || isIsolated) {
           svg.style("display", "none");
           document.getElementById("placeholder").style.display = "block";
           document.getElementById("placeholder").textContent = `No lineage found for "${term}"`;
@@ -113,14 +117,19 @@
 
         data.nodes.forEach(node => {
           if (relatedNodes.has(node.id.toLowerCase())) {
-            const bgColor =
+            const isFocused = node.id.toLowerCase() === term;
+            const bgColor = isFocused ? "#ffeb3b" : (
               node.type === 'source' ? "#b2dfdb"
               : node.type === 'target' ? "#c8e6c9"
-              : "#f8bbd0";
+              : "#f8bbd0"
+            );
+            const borderColor = isFocused ? "#f57c00" : "#333";
+            const fontWeight = isFocused ? "bold" : "normal";
+
             g.setNode(node.id, {
               labelType: "text",
               label: `${node.id}${node.operation ? '\n(' + node.operation + ')' : ''}`,
-              style: `fill: ${bgColor}; stroke: #333; stroke-width: 1.5px;`,
+              style: `fill: ${bgColor}; stroke: ${borderColor}; stroke-width: 2px; font-weight: ${fontWeight};`,
               padding: 10,
               rx: 6,
               ry: 6
@@ -130,13 +139,17 @@
 
         relatedEdges.forEach(link => {
           const isDashed = /left|right|full|outer/i.test(link.join_type || "");
+          const isFocusedEdge = (
+            link.source.toLowerCase() === term ||
+            link.target.toLowerCase() === term
+          );
           g.setEdge(link.source, link.target, {
             arrowhead: "vee",
             lineInterpolate: "basis",
             label: link.join_type || "",
             style: `
-              stroke: #333;
-              stroke-width: 1.5px;
+              stroke: ${isFocusedEdge ? "#f57c00" : "#333"};
+              stroke-width: ${isFocusedEdge ? "2.5px" : "1.5px"};
               stroke-dasharray: ${isDashed ? "4,2" : "none"};
               marker-end: url(#arrowhead);
               fill: none;
