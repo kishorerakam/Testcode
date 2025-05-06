@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Dagre-D3 Auto-Resize</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script src="https://unpkg.com/dagre-d3@0.6.4/dist/dagre-d3.min.js"></script>
+  <style>
+    svg {
+      width: 100%;
+      height: auto;
+      border: 2px solid lightgray;
+    }
+    .node rect {
+      fill: #ffffff;
+      stroke: #333;
+      stroke-width: 1.5px;
+    }
+    .node text {
+      fill: #333;
+      font-weight: bold;
+    }
+    .edgePath path {
+      stroke: #888;
+      stroke-width: 1.5px;
+    }
+  </style>
+</head>
+<body>
+  <h2>🚀 Dagre-D3 Graph (Auto-Resize + Filter by Table)</h2>
+  <input type="text" id="tableInput" placeholder="Enter table name (e.g. REPORTING_DB.DAILY_ORDER_SUMMARY)">
+  <button onclick="handleSearch()">Show SQL</button>
+  <svg id="svg_abcd"></svg>
+
+  <script>
+    const expandedNodes = new Set();
+    let fullData = { nodes: [], links: [] };
+    let nodePositions = {};
+
+    const savedExpanded = JSON.parse(localStorage.getItem("expandedNodes") || "[]");
+    savedExpanded.forEach(n => expandedNodes.add(n));
+
+    const table_file_index = {
+      "PRODDB.CURRENT_BALANCE": ["step2_enrich_customer.sql", "step3_final_reporting.sql"],
+      "PRODDB.ENRICHED_HIGH_VALUE_ORDERS": ["step3_final_reporting.sql"],
+      "RAW_DB.CUSTOMER_DIM": ["step3_final_reporting.sql"],
+      "RAW_DB.PRODUCT_DIM": ["step3_final_reporting.sql"],
+      "REPORTING_DB.DAILY_ORDER_SUMMARY": ["step3_final_reporting.sql"],
+      "STAGE1": ["step2_enrich_customer.sql"]
+    };
+
+    const sqlDataMap = {
+      "step3_final_reporting.sql": {
+        nodes: [
+          {"id": "PRODDB.ENRICHED_HIGH_VALUE_ORDERS", "type": "source", "operation": "", "is_temp": false, "file": "step3_final_reporting.sql"},
+          {"id": "RAW_DB.CUSTOMER_DIM", "type": "source", "operation": "", "is_temp": false, "file": "step3_final_reporting.sql"},
+          {"id": "RAW_DB.PRODUCT_DIM", "type": "source", "operation": "", "is_temp": false, "file": "step3_final_reporting.sql"},
+          {"id": "REPORTING_DB.DAILY_ORDER_SUMMARY", "type": "target", "operation": ["I"], "is_temp": false, "file": "step3_final_reporting.sql"}
+        ],
+        links: [
+          {"source": "PRODDB.CURRENT_BALANCE", "target": "REPORTING_DB.DAILY_ORDER_SUMMARY", "join_type": "FROM"},
+          {"source": "PRODDB.ENRICHED_HIGH_VALUE_ORDERS", "target": "REPORTING_DB.DAILY_ORDER_SUMMARY", "join_type": "FROM"},
+          {"source": "RAW_DB.CUSTOMER_DIM", "target": "REPORTING_DB.DAILY_ORDER_SUMMARY", "join_type": "LEFT"},
+          {"source": "RAW_DB.PRODUCT_DIM", "target": "REPORTING_DB.DAILY_ORDER_SUMMARY", "join_type": "LEFT"}
+        ]
+      },
+      "step2_enrich_customer.sql": {
+        nodes: [
+          {"id": "PRODDB.CURRENT_BALANCE", "type": "target", "operation": ["M"], "is_temp": false, "file": "step2_enrich_customer.sql"},
+          {"id": "STAGE1", "type": "source", "operation": "", "is_temp": false, "file": "step2_enrich_customer.sql"}
+        ],
+        links: [
+          {"source": "PRODDB.CURRENT_BALANCE", "target": "REPORTING_DB.DAILY_ORDER_SUMMARY", "join_type": "FROM"},
+          {"source": "STAGE1", "target": "PRODDB.CURRENT_BALANCE", "join_type": "USING"}
+        ]
+      }
+    };
+
+    const nodeIndex = {};
+    Object.values(sqlDataMap).forEach(dataset => {
+      dataset.nodes.forEach(n => {
+        nodeIndex[n.id] = n;
+      });
+    });
+
+    function getFilesForNode(nodeId) {
+      return table_file_index[nodeId] || [];
+    }
+
+    function handleSearch() {
+      const tableName = document.getElementById("tableInput").value.trim();
+      const files = table_file_index[tableName];
+      if (!files) {
+        alert("Table not found in table_file_index.");
+        return;
+      }
+
+      const nodes = [], links = [];
+      const seen = new Set();
+      const collect = (dataset) => {
+        dataset.nodes.forEach(n => {
+          if (!seen.has(n.id)) {
+            seen.add(n.id);
+            nodes.push(n);
+          }
+        });
+        dataset.links.forEach(l => links.push(l));
+      };
+
+      files.forEach(file => {
+        const dataset = sqlDataMap[file];
+        if (dataset) collect(dataset);
+      });
+
+      fullData = { nodes, links };
+      expandedNodes.clear();
+      expandedNodes.add(tableName);
+      drawGraph(fullData, tableName);
+    }
+
+    function drawGraph(data, root) {
+      d3.select("#svg_abcd").selectAll("*").remove();
+
+      const g = new dagreD3.graphlib.Graph()
+        .setGraph({
+          rankdir: "LR",
+          nodesep: 50,
+          ranksep: 50,
+          marginx: 20,
+          marginy: 20,
+          ranker: "longest-path"
+        })
+        .setDefaultEdgeLabel(() => ({}));
+
+      // Fix node positions for existing nodes using cached nodePositions
+      g.setDefaultNodeLabel(function(id) {
+        return {
+          label: id,
+          ...(nodePositions[id] ? { x: nodePositions[id].x, y: nodePositions[id].y } : {})
+        };
+      });
+
+      // Step 1: Get reachable nodes from expandedNodes and root
+      const reachable = new Set();
+      reachable.add(root); // Always show the root node
+      expandedNodes.forEach(n => reachable.add(n));
+
+      // No automatic expansion on initial render — only root and explicitly expanded nodes
+
+      // Step 2: Build a map of nodes to render
+      const nodeMap = new Map();
+      data.nodes.forEach(n => {
+        const hasUpstream = data.links.some(link => link.target === n.id);
+        if (reachable.has(n.id) || hasUpstream) {
+          nodeMap.set(n.id, n);
+        }
+      });
+      data.links.forEach(link => {
+        [link.source, link.target].forEach(id => {
+          if (!nodeMap.has(id) && reachable.has(id)) {
+            nodeMap.set(id, nodeIndex[id] || { id, type: "unknown" });
+          }
+        });
+      });
+
+      // Step 3: Render nodes
+      nodeMap.forEach(node => {
+        let style = "fill: #fff";
+        if (node.type === "source") style = "fill: #e3f2fd";
+        else if (node.type === "target") style = "fill: #ffe0b2";
+        else if (node.type === "unknown") style = "fill: #ffcdd2";
+        const prev = nodePositions[node.id];
+        // Determine if node has expandable upstream children
+        const upstreamChildren = data.links.filter(link => link.target === node.id).map(link => link.source);
+        const expandable = upstreamChildren.filter(child => !expandedNodes.has(child)).length > 0;
+        g.setNode(node.id, {
+          label: expandable ? `${node.id} ➕` : node.id,
+          style,
+          ...(prev ? { x: prev.x, y: prev.y } : {})
+        });
+      });
+
+      // Step 4: Render links for current expansion
+      data.links.forEach(link => {
+        if (reachable.has(link.source) && reachable.has(link.target)) {
+          g.setEdge(link.source, link.target, {
+            label: link.join_type || "",
+            arrowhead: "vee"
+          });
+        }
+      });
+
+      const svg = d3.select("#svg_abcd");
+      const width = window.innerWidth;
+      svg.attr("width", width);
+      const svgGroup = svg.append("g");
+
+      const render = new dagreD3.render();
+      render(svgGroup, g);
+
+      g.nodes().forEach(n => {
+        const pos = g.node(n);
+        nodePositions[n] = { x: pos.x, y: pos.y };
+      });
+
+      const xCenterOffset = (width - g.graph().width) / 2;
+      svgGroup.attr("transform", `translate(${xCenterOffset}, 20)`);
+      svg.attr("height", g.graph().height + 40);
+
+      // Step 5: Click to expand only upstream (source/parent) nodes
+      svgGroup.selectAll("g.node").on("click", function (event, nodeId) {
+        console.log("🖱️ Clicked node:", nodeId);
+        const connected = data.links
+          .filter(link => link.target === nodeId)
+          .map(link => link.source);
+        console.log("📦 Upstream (source) nodes of clicked node:", connected);
+        let added = false;
+        connected.forEach(n => {
+          if (!expandedNodes.has(n)) {
+            expandedNodes.add(n);
+            const files = getFilesForNode(n);
+            files.forEach(file => {
+              const dataset = sqlDataMap[file];
+              if (dataset) {
+                dataset.nodes.forEach(node => {
+                  if (!fullData.nodes.find(x => x.id === node.id)) {
+                    fullData.nodes.push(node);
+                  }
+                });
+                dataset.links.forEach(link => {
+                  if (!fullData.links.find(x => x.source === link.source && x.target === link.target)) {
+                    fullData.links.push(link);
+                  }
+                });
+              }
+            });
+            added = true;
+            localStorage.setItem("expandedNodes", JSON.stringify([...expandedNodes]));
+          }
+        });
+
+        if (connected.length === 0 || !added) {
+          const msg = connected.length === 0
+            ? "🚫 No upstream nodes"
+            : "✅ Already expanded";
+          const labelId = `label-${nodeId}`;
+          // Remove old label if exists
+          svgGroup.select(`#${labelId}`).remove();
+          const node = g.node(nodeId);
+          svgGroup.append("text")
+            .attr("id", labelId)
+            .attr("x", node.x)
+            .attr("y", node.y - 25)
+            .attr("text-anchor", "middle")
+            .attr("fill", "#d32f2f")
+            .attr("font-size", "11px")
+            .attr("font-weight", "bold")
+            .text(msg);
+          setTimeout(() => {
+            const labelEl = document.getElementById(labelId);
+            if (labelEl) labelEl.remove();
+          }, 1500);
+        } else {
+          console.log("🔄 Redrawing graph with new expansions...");
+          drawGraph(data, root);
+        }
+      });
+    }
+
+let lastTable = "";
+
+window.addEventListener("resize", () => {
+  const table = document.getElementById("tableInput").value.trim();
+  if (table !== lastTable && table_file_index[table]) {
+    lastTable = table;
+    handleSearch();
+  }
+});
+  </script>
+</body>
+</html>
