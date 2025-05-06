@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Lineage Graph</title>
+  <script src="https://d3js.org/d3.v6.min.js"></script>
+  <script src="https://unpkg.com/dagre-d3@0.6.4/dist/dagre-d3.min.js"></script>
+  <style>
+    body {
+      font-family: sans-serif;
+      padding: 20px;
+    }
+    #graph-container {
+      width: 100%;
+      height: 800px;
+      border: 1px solid #ccc;
+      display: none;
+    }
+    input {
+      margin-bottom: 15px;
+      font-size: 16px;
+      padding: 5px 10px;
+    }
+    .graph-tooltip {
+      transition: opacity 0.2s ease;
+    }
+    #directionSelect {
+      margin-top: 10px;
+      width: 100%;
+      font-size: 16px;
+      padding: 6px 12px;
+    }
+    @keyframes dashFlow {
+      to {
+        stroke-dashoffset: -20;
+      }
+    }
+    #autocompleteList {
+      position: absolute;
+      z-index: 2000;
+      background: white;
+      border: 1px solid #ccc;
+      width: 280px;
+      max-height: 200px;
+      overflow-y: auto;
+      display: none;
+    }
+    #autocompleteList div {
+      padding: 6px 10px;
+      cursor: pointer;
+    }
+    #autocompleteList div:hover {
+      background-color: #f0f0f0;
+    }
+
+    #control-panel {
+      width: 300px;
+      padding: 20px;
+      background-color: #f7f7f7;
+      border-right: 1px solid #ccc;
+      font-family: Arial, sans-serif;
+    }
+
+    #control-panel input[type="text"] {
+      font-size: 16px;
+      padding: 6px 12px;
+      margin-bottom: 10px;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    #control-panel select,
+    #control-panel button {
+      width: 100%;
+      padding: 8px;
+      margin-bottom: 12px;
+      font-size: 14px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+
+    #control-panel button {
+      background-color: #007bff;
+      color: white;
+      border: none;
+      cursor: pointer;
+    }
+
+    #control-panel button:hover {
+      background-color: #0056b3;
+    }
+
+    #sqlFileScroll button {
+      display: block;
+      width: 100%;
+      margin-bottom: 5px;
+      background-color: #ffffff;
+      border: 1px solid #ccc;
+      font-size: 14px;
+      font-weight: bold;
+      color: #333333;
+      text-align: left;
+      padding: 6px 10px;
+      white-space: normal;
+      word-break: break-word;
+      max-width: 100%;
+    }
+
+    #sqlFileScroll button:hover {
+      background-color: #d0d0d0;
+    }
+  </style>
+</head>
+<body style="display: grid; grid-template-columns: 320px 1fr; gap: 20px; align-items: start;">
+  <button id="resetZoomBtn"
+    style="position: fixed; bottom: 20px; left: 340px; z-index: 1000; padding: 8px 14px; font-size: 14px;">
+    🔄 Reset Zoom
+  </button>
+  <div id="control-panel">
+    <h2>Lineage Control</h2>
+    <input type="text" id="tableSearch" placeholder="Enter table name..." />
+    <div id="autocompleteList"></div>
+    <button id="viewBtn" style="margin-top: 10px; width: 100%;">View Lineage</button>
+    <select id="directionSelect">
+      <option value="up">Show Upstream</option>
+      <option value="down">Show Downstream</option>
+      <option value="both" selected>Show Both</option>
+    </select>
+    <div id="placeholder" style="margin-top: 10px; color: gray;">Please enter the table name to view its lineage.</div>
+    <div id="sqlFileList" style="margin-top: 10px;"></div>
+    <div style="margin-top: 15px; font-size: 13px; color: #555;">
+      <strong>Legend:</strong> I → INSERT, U → UPDATE, M → MERGE, C → CREATE
+    </div>
+  </div>
+  <div id="graph-container" style="height:800px; border:1px solid #ccc;"></div>
+<script>
+  const container = d3.select("#graph-container");
+  // Track which SQL files have already been loaded for cross-file expansion
+  const alreadyLoadedFiles = new Set();
+  // Global normalized tableFileIndexMap for cross-file expansion
+  let tableFileIndexMap = null;
+  fetch("table_file_index.json")
+    .then(res => res.json())
+    .then(data => {
+      tableFileIndexMap = {};
+      for (const [key, files] of Object.entries(data)) {
+        tableFileIndexMap[key.toUpperCase()] = files;
+      }
+    });
+  container.html(""); // clear before re-rendering
+  const svg = container.append("svg").attr("width", "100%").attr("height", "800");
+  const svgGroup = svg.append("g");
+
+  // Add zoom and pan behavior
+  const zoom = d3.zoom().on("zoom", function (event) {
+    svgGroup.attr("transform", event.transform);
+  });
+  container.call(zoom);
+
+  let initialZoomTransform = d3.zoomIdentity;
+
+  function applyZoom(transform) {
+    svg.transition().duration(500).call(zoom.transform, transform);
+  }
+
+  document.getElementById("resetZoomBtn").addEventListener("click", () => {
+    applyZoom(initialZoomTransform);
+  });
+
+  // Define arrow marker
+  svg.append("defs").append("marker")
+    .attr("id", "arrowhead")
+    .attr("viewBox", "0 -5 10 10")
+    .attr("refX", 20)
+    .attr("refY", 0)
+    .attr("markerWidth", 6)
+    .attr("markerHeight", 6)
+    .attr("orient", "auto")
+    .append("path")
+    .attr("d", "M0,-5L10,0L0,5")
+    .attr("fill", "#333");
+
+  let currentDirection = "both";
+  document.getElementById("directionSelect").addEventListener("change", function () {
+    currentDirection = this.value;
+  });
+  let graphData = null;
+  let g = null;
+  const expandedNodes = new Map();
+  const childExpandIndex = new Map();
+  let lastExpandedNodeId = null;
+
+  function createNodeLabel(n) {
+    if (!n || !n.id || n.id.trim() === "") return "<div style='padding:4px;'>[invalid]</div>";
+    let ops = '';
+    if (Array.isArray(n.operation)) {
+      ops = n.operation.join(',');
+    } else if (typeof n.operation === 'string' && n.operation.trim() !== '') {
+      ops = n.operation;
+    }
+    return `<div style='display:flex;align-items:center;justify-content:space-between;gap:8px;'>
+              <span>${n.id}${ops ? '<br>(' + ops + ')' : ''}</span>
+              <span class='copy-icon' data-table="${n.id}" style='cursor:pointer;'>📋</span>
+            </div>`;
+  }
+
+  function addTooltip(nodeId, label) {
+    // Remove existing tooltip if any
+    document.querySelectorAll(".graph-tooltip").forEach(el => el.remove());
+
+    const tooltip = document.createElement("div");
+    tooltip.className = "graph-tooltip";
+    tooltip.textContent = label;
+    tooltip.style.position = "absolute";
+    tooltip.style.background = "rgba(50, 50, 50, 0.85)";
+    tooltip.style.color = "#fff";
+    tooltip.style.padding = "4px 8px";
+    tooltip.style.borderRadius = "4px";
+    tooltip.style.fontSize = "12px";
+    tooltip.style.pointerEvents = "none";
+    tooltip.style.zIndex = 9999;
+    document.body.appendChild(tooltip);
+    return tooltip;
+  }
+
+  const navigationHistory = [];
+
+  function trackHistory(nodeId) {
+    navigationHistory.push(nodeId);
+    console.log("History:", navigationHistory);
+  }
+
+  async function renderGraph() {
+    document.querySelectorAll('.no-link-overlay').forEach(el => el.remove());
+    // g.setGraph({ rankdir: "LR" }); // Moved out to initialization
+    g.setDefaultEdgeLabel(() => ({}));
+    g.setDefaultNodeLabel(() => ({}));
+
+
+    // Store the current transform before rendering
+    const render = new dagreD3.render();
+    const previousTransform = d3.zoomTransform(svg.node());
+    render(svgGroup, g);
+
+    svg.selectAll("g.node")
+      .on("mouseover", function (event, nodeId) {
+        const tooltip = addTooltip(nodeId, nodeId);
+        tooltip.style.left = (event.pageX + 10) + "px";
+        tooltip.style.top = (event.pageY + 10) + "px";
+        this.__tooltip = tooltip;
+      })
+      .on("mouseout", function () {
+        if (this.__tooltip) {
+          this.__tooltip.remove();
+          this.__tooltip = null;
+        }
+      });
+
+    // Helper function for dynamic cross-file loading
+    async function loadMissingRelatedNodes(nodeKey) {
+      const upperNodeKey = nodeKey.toUpperCase();
+      const relatedFiles = tableFileIndexMap?.[upperNodeKey] || [];
+      if (relatedFiles.length === 0) {
+        console.warn(`⚠️ No related files found for: ${upperNodeKey}`);
+        return;
+      }
+
+      const fileCache = window._sqlFileCache || (window._sqlFileCache = {});
+      let newDataAdded = false;
+
+      for (const file of relatedFiles) {
+        if (alreadyLoadedFiles.has(file)) continue;
+        alreadyLoadedFiles.add(file);
+
+        let dataset;
+        try {
+          const fileName = file.replace(/\.sql$/i, '');  // remove .sql if present
+          console.log("📥 Fetching file:", `output_partitioned/${fileName}.json`);
+          dataset = fileCache[file] || await fetch(`output_partitioned/${fileName}.json`).then(res => res.json());
+          fileCache[file] = dataset;
+        } catch (err) {
+          console.error(`❌ Failed to load output_partitioned/${file}.json`, err);
+          continue;
+        }
+
+        if (!dataset) continue;
+
+        dataset.nodes.forEach(n => {
+          const id = n.id.toUpperCase();
+          if (!graphData.nodeMap[id]) {
+            graphData.nodeMap[id] = n;
+            graphData.nodes.push(n);
+            newDataAdded = true;
+          }
+        });
+
+        dataset.links.forEach(l => {
+          const src = l.source.toUpperCase();
+          const tgt = l.target.toUpperCase();
+          if (!graphData.links.some(link => link.source.toUpperCase() === src && link.target.toUpperCase() === tgt)) {
+            graphData.links.push({ ...l, source: src, target: tgt });
+            if (!graphData.nodeMap[src]) {
+              graphData.nodeMap[src] = { id: src, type: "source", operation: [], is_temp: false, file };
+              graphData.nodes.push(graphData.nodeMap[src]);
+            }
+            if (!graphData.nodeMap[tgt]) {
+              graphData.nodeMap[tgt] = { id: tgt, type: "target", operation: [], is_temp: false, file };
+              graphData.nodes.push(graphData.nodeMap[tgt]);
+            }
+            newDataAdded = true;
+          }
+        });
+      }
+
+      if (newDataAdded) {
+        const newNode = graphData.nodeMap[upperNodeKey];
+        if (newNode && !g.hasNode(newNode.id)) {
+          g.setNode(newNode.id, {
+            label: createNodeLabel(newNode),
+            labelType: "html",
+            style: `fill: ${newNode.type === 'source' ? "#b2dfdb" : "#c8e6c9"}; stroke: #333; stroke-width: 2px;`,
+            padding: 10,
+            rx: 6,
+            ry: 6
+          });
+        }
+        renderGraph();
+        setTimeout(() => {
+          document.querySelectorAll("g.node").forEach(n => {
+            const nodeLabel = n.querySelector("tspan")?.textContent?.toUpperCase();
+            if (nodeLabel && nodeLabel === upperNodeKey) {
+              n.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+            }
+          });
+        }, 300);
+      }
+    }
+
+    svg.selectAll("g.node").on("click", async function(event, nodeId) {
+      trackHistory(nodeId);
+      //const nodeKey = nodeId.toLowerCase();
+      const nodeKey = nodeId.toUpperCase();
+      // Dynamically load missing related nodes from other SQL files
+      await loadMissingRelatedNodes(nodeKey);
+      const node = graphData.nodeMap[nodeKey];
+      if (!node) return;
+
+      if (!expandedNodes.has(nodeKey)) {
+        expandedNodes.set(nodeKey, new Set());
+      }
+
+      const directionsSet = expandedNodes.get(nodeKey);
+      const isExpanded = directionsSet.has(currentDirection);
+      if (isExpanded) return; // prevent re-expansion on same direction
+
+      const matchingLinks = graphData.links.filter(link => {
+        if (currentDirection === "down") return link.source.toUpperCase() === nodeKey;
+        if (currentDirection === "up") return link.target.toUpperCase() === nodeKey;
+        if (currentDirection === "both") return (
+          link.source.toUpperCase() === nodeKey || link.target.toUpperCase() === nodeKey
+        );
+        return false;
+      });
+
+      let added = false;
+      for (const link of matchingLinks) {
+        const nextId = currentDirection === "down" ? link.target.toUpperCase() : link.source.toUpperCase();
+        if (!g.hasNode(nextId)) {
+          const n = graphData.nodeMap[nextId];
+          console.log("🔍 Attempting to add node:", nextId, "-> Found in nodeMap?", !!n);
+          if (n && n.id && typeof n.id === "string" && n.id.trim() !== "") {
+            console.log("✅ Adding node to graph:", n.id);
+            g.setNode(n.id, {
+              label: createNodeLabel(n),
+              labelType: "html",
+              style: `fill: ${n.type === 'source' ? "#b2dfdb" : "#c8e6c9"}; stroke: #333; stroke-width: 2px;`,
+              padding: 10,
+              rx: 6,
+              ry: 6
+            });
+            added = true;
+          }
+        }
+
+        if (!g.hasEdge(link.source, link.target) && g.hasNode(link.source) && g.hasNode(link.target)) {
+          const isDashed = /left|right|full|outer/i.test(link.join_type || "");
+          // Updated block for edge styling based on direction
+          let color = "#333";
+          const targetOp = (graphData.nodeMap[link.target.toUpperCase()]?.operation || []).join(",");
+          if (targetOp.includes("I")) color = "#4caf50"; // green for INSERT
+          else if (targetOp.includes("U")) color = "#ff9800"; // orange for UPDATE
+          else if (targetOp.includes("M")) color = "#f44336"; // red for MERGE
+          else if ((link.join_type || "").toUpperCase() === "LEFT") color = "#42a5f5";
+          else if ((link.join_type || "").toUpperCase() === "RIGHT") color = "#ab47bc";
+
+          let edgeStyle;
+          if (currentDirection === "down" || currentDirection === "up" || currentDirection === "both") {
+            const animated = (currentDirection === "down" || currentDirection === "both");
+            edgeStyle = `
+              stroke: ${color};
+              stroke-width: 2px;
+              stroke-dasharray: 6, 3;
+              animation: dashFlow 1.5s linear infinite;
+              marker-end: url(#arrowhead);
+              fill: none;
+            `;
+          } else {
+            edgeStyle = `
+              stroke: ${color};
+              stroke-width: 1.5px;
+              marker-end: url(#arrowhead);
+              fill: none;
+            `;
+          }
+          g.setEdge(link.source, link.target, {
+            arrowhead: "vee",
+            lineInterpolate: "basis",
+            label: link.join_type || "",
+            style: edgeStyle,
+            labelStyle: "font-size: 11px; fill: #000; font-weight: bold;"
+          });
+        }
+      }
+
+      if (!added) {
+        const currentNode = g.node(nodeKey);
+        if (currentNode && !currentNode.label.includes("No sources or targets")) {
+          showNoSourceOverlay(currentNode, nodeKey);
+        }
+      }
+
+      directionsSet.add(currentDirection);
+      console.log("📦 Total nodes before render:", g.nodeCount());
+      console.log("🔗 Total links before render:", g.edgeCount());
+      renderGraph();
+    });
+
+    // svg.call(zoom.transform, previousTransform);
+
+    // Smooth tree transitions using D3's transition API
+    const graphWidth = g.graph().width;
+    const graphHeight = g.graph().height;
+    const svgElement = svg.node();
+    const svgWidth = svgElement.clientWidth;
+    const svgHeight = svgElement.clientHeight;
+
+    // Fit-to-view: calculate zoom scale and center offset
+    const zoomScale = Math.min(svgWidth / (graphWidth + 40), svgHeight / (graphHeight + 40));
+    const xOffset = (svgWidth - graphWidth * zoomScale) / 2;
+    const yOffset = (svgHeight - graphHeight * zoomScale) / 2;
+
+    if (!initialZoomTransform.k) {
+      initialZoomTransform = d3.zoomIdentity.translate(xOffset, yOffset).scale(zoomScale);
+      applyZoom(initialZoomTransform);
+    }
+
+    svg.transition()
+      .duration(750)
+      .attr("height", graphHeight + 80);
+
+    // (Optional: svgGroup translate left for legacy, but fit-to-view above handles centering)
+    // svgGroup.transition()
+    //   .duration(750)
+    //   .attr("transform", `translate(${xCenterOffset}, 40)`);
+
+    container.style("display", "block");
+    document.getElementById("placeholder").style.display = "none";
+
+    // Attach copy icon click handlers
+    svg.selectAll(".copy-icon").on("click", function(event) {
+      const table = this.getAttribute("data-table");
+      if (table) {
+        navigator.clipboard.writeText(table).catch(() => {});
+      }
+      event.stopPropagation();
+    });
+  }
+
+  document.getElementById("viewBtn").addEventListener("click", function () {
+    //const term = document.getElementById("tableSearch").value.trim().toLowerCase();
+    const term = document.getElementById("tableSearch").value.trim().toUpperCase();
+
+    if (!term) {
+      container.style("display", "none");
+      document.getElementById("placeholder").style.display = "block";
+      document.getElementById("placeholder").textContent = "Please enter the table name to view its lineage.";
+      svgGroup.selectAll("*").remove();
+      expandedNodes.clear();
+      childExpandIndex.clear();
+      graphData = null;
+      g = null;
+      return;
+    }
+
+    fetch("table_file_index.json")
+      .then(res => res.json())
+      .then(index => {
+        // Debug log: loaded index
+        console.log("✅ Loaded table_file_index.json:", index);
+        const sqlListDiv1 = document.getElementById("sqlFileList");
+        sqlListDiv1.innerHTML = "";
+        container.style("display", "none");
+        document.getElementById("placeholder").style.display = "none";
+        svgGroup.selectAll("*").remove();
+        expandedNodes.clear();
+        childExpandIndex.clear();
+        graphData = null;
+        g = null;
+
+        // Case-insensitive search: normalize keys and term, deduplicate files
+        const termNormalized = term.toUpperCase();
+        const indexNormalized = {};
+        for (const [k, v] of Object.entries(index)) {
+          const upperKey = k.toUpperCase();
+          if (!indexNormalized[upperKey]) {
+            indexNormalized[upperKey] = new Set();
+          }
+          v.forEach(f => indexNormalized[upperKey].add(f));
+        }
+        for (const k in indexNormalized) {
+          indexNormalized[k] = [...indexNormalized[k]];
+        }
+        // Debug log: normalized keys
+        console.log("✅ Normalized keys (UPPERCASE):", Object.keys(indexNormalized));
+        const sqlFiles = Object.entries(indexNormalized)
+          .filter(([k]) => k === termNormalized)
+          .flatMap(([_, v]) => v);
+        // Debug log: matching SQL files
+        console.log("✅ Matching SQL files for", termNormalized, ":", sqlFiles);
+
+        if (!sqlFiles || sqlFiles.length === 0) {
+          document.getElementById("placeholder").style.display = "block";
+          document.getElementById("placeholder").textContent = `No lineage found for "${termNormalized}"`;
+          return;
+        }
+
+        const sqlListDiv = document.getElementById("sqlFileList");
+        sqlListDiv.innerHTML = `
+          <input type="text" id="sqlFilter" placeholder="Filter SQL files..." style="margin-bottom: 10px; width: 250px;" />
+          <div id="sqlFileScroll" style="max-height: 300px; overflow-y: auto; border: 1px solid #ccc; padding: 5px;"></div>
+          <button id="showMoreBtn" style="margin-top: 5px;">Show More</button>
+        `;
+        const scrollContainer = document.getElementById("sqlFileScroll");
+        const showMoreBtn = document.getElementById("showMoreBtn");
+        const sqlFilter = document.getElementById("sqlFilter");
+
+        let shownCount = 0;
+        const showLimit = 20;
+
+        function renderSQLButtons(filter = "") {
+          scrollContainer.innerHTML = "";
+          let filtered = sqlFiles.filter(f => f.toLowerCase().includes(filter.toLowerCase()));
+          // Reset shownCount when filtering
+          shownCount = 0;
+          let visible = filtered.slice(0, shownCount + showLimit);
+          visible.forEach(file => {
+            const btn = document.createElement("button");
+            btn.textContent = file;
+            btn.style.margin = "5px";
+            btn.onclick = () => loadSQLLineage(file, term);
+            scrollContainer.appendChild(btn);
+          });
+          shownCount += showLimit;
+          showMoreBtn.style.display = shownCount < filtered.length ? "block" : "none";
+        }
+
+        showMoreBtn.onclick = () => renderSQLButtons(sqlFilter.value);
+        sqlFilter.oninput = () => {
+          shownCount = 0;
+          renderSQLButtons(sqlFilter.value);
+        };
+
+        renderSQLButtons();
+      });
+  });
+
+  function loadSQLLineage(file, tableName) {
+    // Fetch both sql_file_data_map.json and table_file_index.json in parallel
+    Promise.all([
+      fetch("sql_file_data_map.json").then(res => res.json()),
+      fetch("table_file_index.json").then(res => res.json())
+    ]).then(([data, table_file_index]) => {
+      // Get all files for the table (UPPERCASE)
+      const files = table_file_index[tableName.toUpperCase()] || [];
+      const nodes = [], links = [], seen = new Set();
+      files.forEach(file => {
+        const dataset = data[file];
+        if (!dataset) return;
+        dataset.nodes.forEach(n => {
+          if (!seen.has(n.id)) {
+            seen.add(n.id);
+            nodes.push({ ...n, id: n.id.toUpperCase() });
+          }
+        });
+        dataset.links.forEach(l => {
+          links.push({
+            ...l,
+            source: l.source.toUpperCase(),
+            target: l.target.toUpperCase()
+          });
+        });
+      });
+
+      const nodeMap = Object.fromEntries(nodes.map(n => [n.id, n]));
+
+      // Ensure all nodes referenced in links are included
+      links.forEach(l => {
+        if (!nodeMap[l.source]) {
+          nodeMap[l.source] = { id: l.source, type: "source", operation: [], is_temp: false };
+          nodes.push(nodeMap[l.source]);
+        }
+        if (!nodeMap[l.target]) {
+          nodeMap[l.target] = { id: l.target, type: "target", operation: [], is_temp: false };
+          nodes.push(nodeMap[l.target]);
+        }
+      });
+
+      graphData = { nodes, links, nodeMap };
+
+      const termNode = graphData.nodeMap[tableName.toUpperCase()];
+      if (!termNode || !termNode.id) {
+        document.getElementById("placeholder").style.display = "block";
+        document.getElementById("placeholder").textContent = `No lineage found for "${tableName}"`;
+        return;
+      }
+
+      svgGroup.selectAll("*").remove();
+      expandedNodes.clear();
+      childExpandIndex.clear();
+      const isInsert = (termNode.operation || []).includes("I");
+      const fillColor = isInsert ? "#fff59d" : "#ffeb3b";
+      g = new dagreD3.graphlib.Graph().setGraph({
+        rankdir: "LR",
+        ranksep: 80,
+        nodesep: 100,
+        marginx: 20,
+        marginy: 20,
+        ranker: "longest-path"
+      });
+      g.setNode(termNode.id, {
+        label: createNodeLabel(termNode),
+        labelType: "html",
+        style: `fill: ${fillColor}; stroke: #f57c00; stroke-width: 2.5px; font-weight: bold;`,
+        padding: 10,
+        rx: 6,
+        ry: 6
+      });
+
+      expandedNodes.set(tableName.toUpperCase(), new Set());
+      renderGraph();
+      container.style("display", "block");
+    });
+  }
+
+  // Optional: add Enter key support
+  document.getElementById("tableSearch").addEventListener("keypress", function(e) {
+    if (e.key === 'Enter') {
+      document.getElementById("viewBtn").click();
+    }
+  });
+
+
+
+
+  function showNoSourceOverlay(node, nodeId) {
+    const [x, y] = [node.x, node.y];
+    const overlay = document.createElement("div");
+    overlay.textContent = "No sources or targets";
+    overlay.style.position = "absolute";
+    overlay.style.left = `${x + 10}px`;
+    overlay.style.top = `${y - 20}px`;
+    overlay.style.background = "#fff4c4";
+    overlay.style.border = "1px solid #999";
+    overlay.style.padding = "4px 8px";
+    overlay.style.fontSize = "12px";
+    overlay.style.borderRadius = "4px";
+    overlay.style.pointerEvents = "none";
+    overlay.style.zIndex = 9999;
+    overlay.className = "no-link-overlay";
+    document.body.appendChild(overlay);
+    setTimeout(() => overlay.remove(), 2000);
+  }
+</script>
+<script>
+  const tableInput = document.getElementById("tableSearch");
+  const autocompleteList = document.getElementById("autocompleteList");
+  let allTables = [];
+
+  fetch("table_file_index.json")
+    .then(res => res.json())
+    .then(data => {
+      allTables = Object.keys(data).map(k => k.toUpperCase());
+    });
+
+  tableInput.addEventListener("input", function () {
+    const val = this.value.toUpperCase();
+    autocompleteList.innerHTML = "";
+    if (!val) {
+      autocompleteList.style.display = "none";
+      return;
+    }
+
+    const matches = allTables.filter(t => t.toUpperCase().includes(val)).slice(0, 10);
+    if (matches.length === 0) {
+      autocompleteList.style.display = "none";
+      return;
+    }
+
+    matches.forEach(table => {
+      const div = document.createElement("div");
+      div.textContent = table;
+      div.onclick = () => {
+        tableInput.value = table;
+        autocompleteList.style.display = "none";
+        document.getElementById("viewBtn").click();
+      };
+      autocompleteList.appendChild(div);
+    });
+
+    const rect = tableInput.getBoundingClientRect();
+    autocompleteList.style.top = `${rect.bottom + window.scrollY}px`;
+    autocompleteList.style.left = `${rect.left + window.scrollX}px`;
+    autocompleteList.style.width = `${rect.width}px`;
+    autocompleteList.style.display = "block";
+  });
+
+  document.addEventListener("click", function (e) {
+    if (e.target !== tableInput && e.target.parentNode !== autocompleteList) {
+      autocompleteList.style.display = "none";
+    }
+  });
+</script>
+</body>
+</html>
