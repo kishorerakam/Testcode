@@ -24,6 +24,12 @@
       stroke: #888;
       stroke-width: 1.5px;
     }
+    #tableInput {
+      width: 300px;
+      height: 35px;
+      font-size: 16px;
+      padding: 5px;
+    }
   </style>
 </head>
 <body>
@@ -117,9 +123,12 @@
           const dataset = sqlDataMap[file];
           if (!dataset) return;
 
-          // Only add the node for this table in this file, not unrelated siblings
+          // Only include the node being searched and any *source* nodes that lead to it recursively, not unrelated nodes
           dataset.nodes.forEach(n => {
-            if (n.id === table && !seenNodes.has(n.id)) {
+            if (
+              (n.id === table || dataset.links.some(l => l.target === table && l.source === n.id)) &&
+              !seenNodes.has(n.id)
+            ) {
               seenNodes.add(n.id);
               nodes.push(n);
             }
