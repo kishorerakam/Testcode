@@ -241,6 +241,23 @@
     const previousTransform = d3.zoomTransform(svg.node());
     render(svgGroup, g);
 
+    // Enable dragging and moving of nodes
+    svg.selectAll("g.node").call(
+      d3.drag()
+        .on("start", function (event, d) {
+          d3.select(this).classed("dragging", true);
+        })
+        .on("drag", function (event, d) {
+          const transform = d3.zoomTransform(svg.node());
+          const newX = (event.x - transform.x) / transform.k;
+          const newY = (event.y - transform.y) / transform.k;
+          d3.select(this).attr("transform", `translate(${newX},${newY})`);
+        })
+        .on("end", function (event, d) {
+          d3.select(this).classed("dragging", false);
+        })
+    );
+
     svg.selectAll("g.node")
       .on("mouseover", function (event, nodeId) {
         const tooltip = addTooltip(nodeId, nodeId);
@@ -274,9 +291,10 @@
         let dataset;
         try {
           const fileName = file.replace(/\.sql$/i, '');  // remove .sql if present
+          const cacheKey = `${fileName}.json`;
           console.log("📥 Fetching file:", `output_partitioned/${fileName}.json`);
-          dataset = fileCache[file] || await fetch(`output_partitioned/${fileName}.json`).then(res => res.json());
-          fileCache[file] = dataset;
+          dataset = fileCache[cacheKey] || await fetch(`output_partitioned/${fileName}.json`).then(res => res.json());
+          fileCache[cacheKey] = dataset;
         } catch (err) {
           console.error(`❌ Failed to load output_partitioned/${file}.json`, err);
           continue;
@@ -574,23 +592,22 @@
   });
 
   function loadSQLLineage(file, tableName) {
-    // Fetch both sql_file_data_map.json and table_file_index.json in parallel
-    Promise.all([
-      fetch("sql_file_data_map.json").then(res => res.json()),
-      fetch("table_file_index.json").then(res => res.json())
-    ]).then(([data, table_file_index]) => {
-      // Get all files for the table (UPPERCASE)
-      const files = table_file_index[tableName.toUpperCase()] || [];
-      const nodes = [], links = [], seen = new Set();
-      files.forEach(file => {
-        const dataset = data[file];
-        if (!dataset) return;
+    const fileName = file.replace(/\.sql$/i, '');
+    fetch(`output_partitioned/${fileName}.json`)
+      .then(res => res.json())
+      .then(dataset => {
+        const nodes = [];
+        const links = [];
+        const seen = new Set();
+
         dataset.nodes.forEach(n => {
-          if (!seen.has(n.id)) {
-            seen.add(n.id);
-            nodes.push({ ...n, id: n.id.toUpperCase() });
+          const id = n.id.toUpperCase();
+          if (!seen.has(id)) {
+            seen.add(id);
+            nodes.push({ ...n, id });
           }
         });
+
         dataset.links.forEach(l => {
           links.push({
             ...l,
@@ -598,57 +615,56 @@
             target: l.target.toUpperCase()
           });
         });
-      });
 
-      const nodeMap = Object.fromEntries(nodes.map(n => [n.id, n]));
+        const nodeMap = Object.fromEntries(nodes.map(n => [n.id, n]));
 
-      // Ensure all nodes referenced in links are included
-      links.forEach(l => {
-        if (!nodeMap[l.source]) {
-          nodeMap[l.source] = { id: l.source, type: "source", operation: [], is_temp: false };
-          nodes.push(nodeMap[l.source]);
+        // Ensure all nodes referenced in links are included
+        links.forEach(l => {
+          if (!nodeMap[l.source]) {
+            nodeMap[l.source] = { id: l.source, type: "source", operation: [], is_temp: false };
+            nodes.push(nodeMap[l.source]);
+          }
+          if (!nodeMap[l.target]) {
+            nodeMap[l.target] = { id: l.target, type: "target", operation: [], is_temp: false };
+            nodes.push(nodeMap[l.target]);
+          }
+        });
+
+        graphData = { nodes, links, nodeMap };
+
+        const termNode = graphData.nodeMap[tableName.toUpperCase()];
+        if (!termNode || !termNode.id) {
+          document.getElementById("placeholder").style.display = "block";
+          document.getElementById("placeholder").textContent = `No lineage found for "${tableName}"`;
+          return;
         }
-        if (!nodeMap[l.target]) {
-          nodeMap[l.target] = { id: l.target, type: "target", operation: [], is_temp: false };
-          nodes.push(nodeMap[l.target]);
-        }
+
+        svgGroup.selectAll("*").remove();
+        expandedNodes.clear();
+        childExpandIndex.clear();
+        const isInsert = (termNode.operation || []).includes("I");
+        const fillColor = isInsert ? "#fff59d" : "#ffeb3b";
+        g = new dagreD3.graphlib.Graph().setGraph({
+          rankdir: "LR",
+          ranksep: 80,
+          nodesep: 100,
+          marginx: 20,
+          marginy: 20,
+          ranker: "longest-path"
+        });
+        g.setNode(termNode.id, {
+          label: createNodeLabel(termNode),
+          labelType: "html",
+          style: `fill: ${fillColor}; stroke: #f57c00; stroke-width: 2.5px; font-weight: bold;`,
+          padding: 10,
+          rx: 6,
+          ry: 6
+        });
+
+        expandedNodes.set(tableName.toUpperCase(), new Set());
+        renderGraph();
+        container.style("display", "block");
       });
-
-      graphData = { nodes, links, nodeMap };
-
-      const termNode = graphData.nodeMap[tableName.toUpperCase()];
-      if (!termNode || !termNode.id) {
-        document.getElementById("placeholder").style.display = "block";
-        document.getElementById("placeholder").textContent = `No lineage found for "${tableName}"`;
-        return;
-      }
-
-      svgGroup.selectAll("*").remove();
-      expandedNodes.clear();
-      childExpandIndex.clear();
-      const isInsert = (termNode.operation || []).includes("I");
-      const fillColor = isInsert ? "#fff59d" : "#ffeb3b";
-      g = new dagreD3.graphlib.Graph().setGraph({
-        rankdir: "LR",
-        ranksep: 80,
-        nodesep: 100,
-        marginx: 20,
-        marginy: 20,
-        ranker: "longest-path"
-      });
-      g.setNode(termNode.id, {
-        label: createNodeLabel(termNode),
-        labelType: "html",
-        style: `fill: ${fillColor}; stroke: #f57c00; stroke-width: 2.5px; font-weight: bold;`,
-        padding: 10,
-        rx: 6,
-        ry: 6
-      });
-
-      expandedNodes.set(tableName.toUpperCase(), new Set());
-      renderGraph();
-      container.style("display", "block");
-    });
   }
 
   // Optional: add Enter key support
@@ -657,9 +673,6 @@
       document.getElementById("viewBtn").click();
     }
   });
-
-
-
 
   function showNoSourceOverlay(node, nodeId) {
     const [x, y] = [node.x, node.y];
