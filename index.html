@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>CSV Validator</title>
+  <style>
+    body { font-family: Arial; padding: 20px; }
+    #progress { width: 100%; background: #eee; border-radius: 5px; margin: 10px 0; height: 20px; }
+    #bar { width: 0%; height: 100%; background: #4caf50; text-align: center; color: white; border-radius: 5px; }
+    #uploadBtn:disabled { background-color: #aaa; }
+  </style>
+</head>
+<body>
+
+<h2>Upload & Validate CSV</h2>
+
+<input type="file" id="fileInput" accept=".csv"><br><br>
+<button id="validateBtn">Validate</button>
+<button id="uploadBtn" disabled>Upload</button>
+
+<div id="progress"><div id="bar">0%</div></div>
+
+<p><strong>File Name:</strong> <span id="fileName">-</span></p>
+<p><strong>Row Count:</strong> <span id="rowCount">-</span></p>
+
+<script>
+const fileInput = document.getElementById("fileInput");
+const validateBtn = document.getElementById("validateBtn");
+const uploadBtn = document.getElementById("uploadBtn");
+const fileName = document.getElementById("fileName");
+const rowCount = document.getElementById("rowCount");
+const progressBar = document.getElementById("bar");
+
+let validatedContent = null;
+
+function setProgress(percent) {
+  progressBar.style.width = percent + "%";
+  progressBar.textContent = percent + "%";
+}
+
+validateBtn.onclick = () => {
+  const file = fileInput.files[0];
+  if (!file) return alert("Please select a CSV file");
+
+  fileName.textContent = file.name;
+  setProgress(10);
+
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("expected_delimiter", 35);
+
+  setProgress(30);
+  fetch("http://localhost:8000/api/validate-csv", {
+    method: "POST",
+    body: formData
+  })
+  .then(async res => {
+    if (!res.ok) {
+      const err = await res.json();
+      setProgress(0);
+      alert("❌ Invalid CSV: " + err.detail);
+      uploadBtn.disabled = true;
+      throw new Error(err.detail);
+    }
+    setProgress(60);
+    return res.json();
+  })
+  .then(data => {
+    // Estimate rows from file
+    const reader = new FileReader();
+    reader.onload = function () {
+      const lines = reader.result.trim().split('\n');
+      rowCount.textContent = lines.length - 1;
+    };
+    reader.readAsText(file);
+
+    setProgress(100);
+    uploadBtn.disabled = false;
+    alert("✅ File validated successfully!");
+  })
+  .catch(console.error);
+};
+
+uploadBtn.onclick = () => {
+  alert("✅ Upload logic goes here!");
+};
+</script>
+
+</body>
+</html>
